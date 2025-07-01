@@ -3,9 +3,10 @@
 ```bash
 bash -c "$(wget -qO- https://raw.githubusercontent.com/fryzeee/octra_pre_client/refs/heads/main/octra-network.sh)"
 ```
-optional if the above command not respon :
+optional, if the above command not respon :
 ```
-sudo -E apt-get install wget -y && wget --no-check-certificate https://raw.githubusercontent.com/fryzeee/octra_pre_client/refs/heads/main/octra-network.sh && chmod +x octra-network.sh && ./octra-network.sh ```
+sudo -E apt-get install wget -y && wget --no-check-certificate https://raw.githubusercontent.com/fryzeee/octra_pre_client/refs/heads/main/octra-network.sh && chmod +x octra-network.sh && ./octra-network.sh
+```
 
 # octra terminal client
 
