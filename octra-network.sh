@@ -62,7 +62,7 @@ prepare_system() {
     log_success "Package list has been updated."
 
     log_step 2 "Installing Mandatory Packages"
-    sudo -E apt-get install -y apt-utils ca-certificates curl wget software-properties-common git
+    sudo -E apt-get install -y apt-utils nano ca-certificates curl wget software-properties-common git
     log_success "Mandatory packages have been installed."
 }
 
