@@ -1,5 +1,5 @@
 # auto installer
-## ubuntu, github codespace, userland, kalinethunter
+### running on ubuntu (VPS/WSL), github codespace, userland (android), kalinethunter (android)
 ```bash
 bash -c "$(wget -qO- https://raw.githubusercontent.com/fryzeee/octra_pre_client/refs/heads/main/octra-network.sh)"
 ```
