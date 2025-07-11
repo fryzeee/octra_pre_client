@@ -171,12 +171,10 @@ main() {
 
     echo -e "\n${COLOR_GREEN}==================================================================${COLOR_NC}"
     echo -e "${COLOR_GREEN}🎉  Installation Complete! �${COLOR_NC}"
-    echo -e "Installation location: ${COLOR_YELLOW}$MAIN_DEST_DIR/$DEST_DIR_NAME${COLOR_NC}"
     echo -e "Next steps:"
     echo -e "1. Open your directory installation: ${COLOR_YELLOW}cd $MAIN_DEST_DIR/$DEST_DIR_NAME${COLOR_NC}"
     echo -e "2. Edit the configuration file: ${COLOR_YELLOW}nano wallet.json${COLOR_NC}"
-    echo -e "3. Activate the venv: ${COLOR_YELLOW}source venv/bin/activate${COLOR_NC}"
-    echo -e "4. Run the program: ${COLOR_YELLOW}python${PYTHON_VERSION} cli.py${COLOR_NC}"
+    echo -e "3. Run the program: ${COLOR_YELLOW}./run.sh${COLOR_NC}"
     echo -e "${COLOR_GREEN}==================================================================${COLOR_NC}"
 }
 
