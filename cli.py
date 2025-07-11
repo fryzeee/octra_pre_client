@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-import json, base64, hashlib, time, sys, re, random, string, os, shutil, asyncio, aiohttp, threading
+import json, base64, hashlib, time, sys, re, os, shutil, asyncio, aiohttp, threading
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 import nacl.signing
-# Dependencies baru untuk generate address
-import base58
-from mnemonic import Mnemonic
+import secrets
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+import hmac
+import ssl
+import signal
 
-c = {'r': '\033[0m', 'b': '\033[94m', 'c': '\033[96m', 'g': '\033[92m', 'y': '\033[93m', 'R': '\033[91m', 'B': '\033[1m', 'bg': '\033[44m', 'bgr': '\033[41m', 'bgg': '\033[42m', 'w': '\033[97m'}
+c = {'r': '\033[0m', 'b': '\033[34m', 'c': '\033[36m', 'g': '\033[32m', 'y': '\033[33m', 'R': '\033[31m', 'B': '\033[1m', 'bg': '\033[44m', 'bgr': '\033[41m', 'bgg': '\033[42m', 'w': '\033[37m'}
 
 priv, addr, rpc = None, None, None
 sk, pub = None, None
@@ -31,11 +33,11 @@ def at(x, y, t, cl=''):
     print(f"\033[{y};{x}H{c['bg']}{cl}{t}{c['bg']}", end='')
 
 def inp(x, y):
-    print(f"\033[{y};{x}H{c['bg']}{c['B']}{c['w']}", end='', flush=True)
+    print(f"\033[{y};{x}H", end='', flush=True)
     return input()
 
 async def ainp(x, y):
-    print(f"\033[{y};{x}H{c['bg']}{c['B']}{c['w']}", end='', flush=True)
+    print(f"\033[{y};{x}H", end='', flush=True)
     try:
         return await asyncio.get_event_loop().run_in_executor(executor, input)
     except:
@@ -68,11 +70,24 @@ async def awaitkey():
 def ld():
     global priv, addr, rpc, sk, pub
     try:
-        with open('wallet.json', 'r') as f:
+        wallet_path = os.path.expanduser("~/.octra/wallet.json")
+        if not os.path.exists(wallet_path):
+            wallet_path = "wallet.json"
+        
+        with open(wallet_path, 'r') as f:
             d = json.load(f)
+        
         priv = d.get('priv')
         addr = d.get('addr')
-        rpc = d.get('rpc', 'https://octra.network')
+        rpc = d.get('rpc', 'http://localhost:8080')
+        
+        if not priv or not addr:
+            return False
+            
+        if not rpc.startswith('https://') and 'localhost' not in rpc:
+            print(f"{c['R']}⚠️  WARNING: Using insecure HTTP connection!{c['r']}")
+            time.sleep(2)
+            
         sk = nacl.signing.SigningKey(base64.b64decode(priv))
         pub = base64.b64encode(sk.verify_key.encode()).decode()
         return True
@@ -104,23 +119,155 @@ async def spin_animation(x, y, msg):
     except asyncio.CancelledError:
         at(x, y, " " * (len(msg) + 3), "")
 
+def derive_encryption_key(privkey_b64):
+    privkey_bytes = base64.b64decode(privkey_b64)
+    salt = b"octra_encrypted_balance_v2"
+    return hashlib.sha256(salt + privkey_bytes).digest()[:32]
+
+def encrypt_client_balance(balance, privkey_b64):
+    key = derive_encryption_key(privkey_b64)
+    aesgcm = AESGCM(key)
+    nonce = secrets.token_bytes(12)
+    plaintext = str(balance).encode()
+    ciphertext = aesgcm.encrypt(nonce, plaintext, None)
+    return "v2|" + base64.b64encode(nonce + ciphertext).decode()
+
+def decrypt_client_balance(encrypted_data, privkey_b64):
+    if encrypted_data == "0" or not encrypted_data:
+        return 0
+    
+    if not encrypted_data.startswith("v2|"):
+        privkey_bytes = base64.b64decode(privkey_b64)
+        salt = b"octra_encrypted_balance_v1"
+        key = hashlib.sha256(salt + privkey_bytes).digest() + hashlib.sha256(privkey_bytes + salt).digest()
+        key = key[:32]
+        
+        try:
+            data = base64.b64decode(encrypted_data)
+            if len(data) < 32:
+                return 0
+            
+            nonce = data[:16]
+            tag = data[16:32]
+            encrypted = data[32:]
+            
+            expected_tag = hashlib.sha256(nonce + encrypted + key).digest()[:16]
+            if not hmac.compare_digest(tag, expected_tag):
+                return 0
+            
+            decrypted = bytearray()
+            key_hash = hashlib.sha256(key + nonce).digest()
+            for i, byte in enumerate(encrypted):
+                decrypted.append(byte ^ key_hash[i % 32])
+            
+            return int(decrypted.decode())
+        except:
+            return 0
+    
+    try:
+        b64_data = encrypted_data[3:]
+        raw = base64.b64decode(b64_data)
+        
+        if len(raw) < 28:
+            return 0
+        
+        nonce = raw[:12]
+        ciphertext = raw[12:]
+        
+        key = derive_encryption_key(privkey_b64)
+        aesgcm = AESGCM(key)
+        
+        plaintext = aesgcm.decrypt(nonce, ciphertext, None)
+        return int(plaintext.decode())
+    except:
+        return 0
+
+def derive_shared_secret_for_claim(my_privkey_b64, ephemeral_pubkey_b64):
+    sk = nacl.signing.SigningKey(base64.b64decode(my_privkey_b64))
+    my_pubkey_bytes = sk.verify_key.encode()
+    eph_pub_bytes = base64.b64decode(ephemeral_pubkey_b64)
+    
+    if eph_pub_bytes < my_pubkey_bytes:
+        smaller, larger = eph_pub_bytes, my_pubkey_bytes
+    else:
+        smaller, larger = my_pubkey_bytes, eph_pub_bytes
+    
+    combined = smaller + larger
+    round1 = hashlib.sha256(combined).digest()
+    round2 = hashlib.sha256(round1 + b"OCTRA_SYMMETRIC_V1").digest()
+    return round2[:32]
+
+def decrypt_private_amount(encrypted_data, shared_secret):
+    if not encrypted_data or not encrypted_data.startswith("v2|"):
+        return None
+    
+    try:
+        raw = base64.b64decode(encrypted_data[3:])
+        if len(raw) < 28:
+            return None
+        
+        nonce = raw[:12]
+        ciphertext = raw[12:]
+        
+        aesgcm = AESGCM(shared_secret)
+        plaintext = aesgcm.decrypt(nonce, ciphertext, None)
+        return int(plaintext.decode())
+    except:
+        return None
+
 async def req(m, p, d=None, t=10):
     global session
     if not session:
-        session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=t))
+        ssl_context = ssl.create_default_context()
+        connector = aiohttp.TCPConnector(ssl=ssl_context, force_close=True)
+        session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=t),
+            connector=connector,
+            json_serialize=json.dumps
+        )
     try:
         url = f"{rpc}{p}"
-        async with getattr(session, m.lower())(url, json=d if m == 'POST' else None) as resp:
+        
+        kwargs = {}
+        if m == 'POST' and d:
+            kwargs['json'] = d
+        
+        async with getattr(session, m.lower())(url, **kwargs) as resp:
             text = await resp.text()
+            
             try:
-                j = json.loads(text) if text else None
+                j = json.loads(text) if text.strip() else None
             except:
                 j = None
+            
             return resp.status, text, j
     except asyncio.TimeoutError:
         return 0, "timeout", None
     except Exception as e:
         return 0, str(e), None
+
+async def req_private(path, method='GET', data=None):
+    headers = {"X-Private-Key": priv}
+    try:
+        url = f"{rpc}{path}"
+        
+        kwargs = {'headers': headers}
+        if method == 'POST' and data:
+            kwargs['json'] = data
+            
+        async with getattr(session, method.lower())(url, **kwargs) as resp:
+            text = await resp.text()
+            
+            if resp.status == 200:
+                try:
+                    return True, json.loads(text) if text.strip() else {}
+                except:
+                    return False, {"error": "Invalid JSON response"}
+            else:
+                return False, {"error": f"HTTP {resp.status}"}
+                
+    except Exception as e:
+        return False, {"error": str(e)}
 
 async def st():
     global cb, cn, lu
@@ -160,6 +307,129 @@ async def st():
             cn, cb = None, None
     return cn, cb
 
+async def get_encrypted_balance():
+    ok, result = await req_private(f"/view_encrypted_balance/{addr}")
+    
+    if ok:
+        try:
+            return {
+                "public": float(result.get("public_balance", "0").split()[0]),
+                "public_raw": int(result.get("public_balance_raw", "0")),
+                "encrypted": float(result.get("encrypted_balance", "0").split()[0]),
+                "encrypted_raw": int(result.get("encrypted_balance_raw", "0")),
+                "total": float(result.get("total_balance", "0").split()[0])
+            }
+        except:
+            return None
+    else:
+        return None
+
+async def encrypt_balance(amount):
+    enc_data = await get_encrypted_balance()
+    if not enc_data:
+        return False, {"error": "cannot get balance"}
+    
+    current_encrypted_raw = enc_data['encrypted_raw']
+    new_encrypted_raw = current_encrypted_raw + int(amount * μ)
+    
+    encrypted_value = encrypt_client_balance(new_encrypted_raw, priv)
+    
+    data = {
+        "address": addr,
+        "amount": str(int(amount * μ)),
+        "private_key": priv,
+        "encrypted_data": encrypted_value
+    }
+    
+    s, t, j = await req('POST', '/encrypt_balance', data)
+    if s == 200:
+        return True, j
+    else:
+        return False, {"error": j.get("error", t) if j else t}
+
+async def decrypt_balance(amount):
+    enc_data = await get_encrypted_balance()
+    if not enc_data:
+        return False, {"error": "cannot get balance"}
+    
+    current_encrypted_raw = enc_data['encrypted_raw']
+    if current_encrypted_raw < int(amount * μ):
+        return False, {"error": "insufficient encrypted balance"}
+    
+    new_encrypted_raw = current_encrypted_raw - int(amount * μ)
+    
+    encrypted_value = encrypt_client_balance(new_encrypted_raw, priv)
+    
+    data = {
+        "address": addr,
+        "amount": str(int(amount * μ)),
+        "private_key": priv,
+        "encrypted_data": encrypted_value
+    }
+    
+    s, t, j = await req('POST', '/decrypt_balance', data)
+    if s == 200:
+        return True, j
+    else:
+        return False, {"error": j.get("error", t) if j else t}
+
+async def get_address_info(address):
+    s, t, j = await req('GET', f'/address/{address}')
+    if s == 200:
+        return j
+    return None
+
+async def get_public_key(address):
+    s, t, j = await req('GET', f'/public_key/{address}')
+    if s == 200:
+        return j.get("public_key")
+    return None
+
+async def create_private_transfer(to_addr, amount):
+    addr_info = await get_address_info(to_addr)
+    if not addr_info or not addr_info.get("has_public_key"):
+        return False, {"error": "Recipient has no public key"}
+    
+    to_public_key = await get_public_key(to_addr)
+    if not to_public_key:
+        return False, {"error": "Cannot get recipient public key"}
+    
+    data = {
+        "from": addr,
+        "to": to_addr,
+        "amount": str(int(amount * μ)),
+        "from_private_key": priv,
+        "to_public_key": to_public_key
+    }
+    
+    s, t, j = await req('POST', '/private_transfer', data)
+    if s == 200:
+        return True, j
+    else:
+        return False, {"error": j.get("error", t) if j else t}
+
+async def get_pending_transfers():
+    ok, result = await req_private(f"/pending_private_transfers?address={addr}")
+    
+    if ok:
+        transfers = result.get("pending_transfers", [])
+        return transfers
+    else:
+        return []
+
+async def claim_private_transfer(transfer_id):
+    data = {
+        "recipient_address": addr,
+        "private_key": priv,
+        "transfer_id": transfer_id
+    }
+    
+    s, t, j = await req('POST', '/claim_private_transfer', data)
+    if s == 200:
+        return True, j
+    else:
+        return False, {"error": j.get("error", t) if j else t}
+
 async def gh():
     global h, lh
     now = time.time()
@@ -190,6 +460,13 @@ async def gh():
                 ii = p.get('to') == addr
                 ar = p.get('amount_raw', p.get('amount', '0'))
                 a = float(ar) if '.' in str(ar) else int(ar) / μ
+                msg = None
+                if 'data' in j2:
+                    try:
+                        data = json.loads(j2['data'])
+                        msg = data.get('message')
+                    except:
+                        pass
                 nh.append({
                     'time': datetime.fromtimestamp(p.get('timestamp', 0)),
                     'hash': tx_hash,
@@ -198,7 +475,8 @@ async def gh():
                     'type': 'in' if ii else 'out',
                     'ok': True,
                     'nonce': p.get('nonce', 0),
-                    'epoch': ref.get('epoch', 0)
+                    'epoch': ref.get('epoch', 0),
+                    'msg': msg
                 })
         
         oh = datetime.now() - timedelta(hours=1)
@@ -208,16 +486,18 @@ async def gh():
         h.clear()
         lh = now
 
-def mk(to, a, n):
+def mk(to, a, n, msg=None):
     tx = {
         "from": addr,
         "to_": to,
         "amount": str(int(a * μ)),
         "nonce": int(n),
         "ou": "1" if a < 1000 else "3",
-        "timestamp": time.time() + random.random() * 0.01
+        "timestamp": time.time()
     }
-    bl = json.dumps(tx, separators=(",", ":"))
+    if msg:
+        tx["message"] = msg
+    bl = json.dumps({k: v for k, v in tx.items() if k != "message"}, separators=(",", ":"))
     sig = base64.b64encode(sk.sign(bl.encode()).signature).decode()
     tx.update(signature=sig, public_key=pub)
     return tx, hashlib.sha256(bl.encode()).hexdigest()
@@ -233,24 +513,6 @@ async def snd(tx):
             return True, t.split()[-1], dt, None
     return False, json.dumps(j) if j else t, dt, j
 
-def generate_octra_address():
-    """Membangkitkan alamat OCTRA acak baru."""
-    mnemo = Mnemonic("english")
-    mnemonic_words = mnemo.generate(strength=128)
-    seed = mnemo.to_seed(mnemonic_words, passphrase="")
-    
-    # Dapatkan kunci dari 32 byte pertama seed
-    signing_key = nacl.signing.SigningKey(seed[:32])
-    public_key_bytes = signing_key.verify_key.encode()
-    
-    # Hash public key untuk membuat payload alamat
-    hash_bytes = hashlib.sha256(public_key_bytes).digest()
-    
-    # Base58 encode hash untuk mendapatkan alamat akhir
-    base58_encoded = base58.b58encode(hash_bytes).decode('utf-8')
-    
-    return "oct" + base58_encoded
-
 async def expl(x, y, w, hb):
     box(x, y, w, hb, "wallet explorer")
     n, b = await st()
@@ -262,72 +524,89 @@ async def expl(x, y, w, hb):
     at(x + 2, y + 4, "nonce:  ", c['c'])
     at(x + 11, y + 4, str(n) if n is not None else "---", c['w'])
     at(x + 2, y + 5, "public: ", c['c'])
-    at(x + 11, y + 5, pub, c['w'])
+    at(x + 11, y + 5, pub[:40] + "...", c['w'])
+    
+    try:
+        enc_data = await get_encrypted_balance()
+        if enc_data:
+            at(x + 2, y + 6, "encrypted:", c['c'])
+            at(x + 13, y + 6, f"{enc_data['encrypted']:.6f} oct", c['B'] + c['y'])
+            
+            pending = await get_pending_transfers()
+            if pending:
+                at(x + 2, y + 7, "claimable:", c['c'])
+                at(x + 13, y + 7, f"{len(pending)} transfers", c['B'] + c['g'])
+    except:
+        pass
+    
     _, _, j = await req('GET', '/staging', 2)
     sc = len([tx for tx in j.get('staged_transactions', []) if tx.get('from') == addr]) if j else 0
-    at(x + 2, y + 6, "staging:", c['c'])
-    at(x + 11, y + 6, f"{sc} pending" if sc else "none", c['y'] if sc else c['w'])
-    at(x + 1, y + 7, "─" * (w - 2), c['w'])
+    at(x + 2, y + 8, "staging:", c['c'])
+    at(x + 11, y + 8, f"{sc} pending" if sc else "none", c['y'] if sc else c['w'])
+    at(x + 1, y + 9, "─" * (w - 2), c['w'])
     
-    at(x + 2, y + 8, "recent transactions:", c['B'] + c['c'])
+    at(x + 2, y + 10, "recent transactions:", c['B'] + c['c'])
     if not h:
-        at(x + 2, y + 10, "no transactions yet", c['y'])
+        at(x + 2, y + 12, "no transactions yet", c['y'])
     else:
-        at(x + 2, y + 10, "time     type  amount      address", c['c'])
-        at(x + 2, y + 11, "─" * (w - 4), c['w'])
+        at(x + 2, y + 12, "time     type  amount      address", c['c'])
+        at(x + 2, y + 13, "─" * (w - 4), c['w'])
         seen_hashes = set()
         display_count = 0
-        # Sort by time descending (newest first)
         sorted_h = sorted(h, key=lambda x: x['time'], reverse=True)
         for tx in sorted_h:
             if tx['hash'] in seen_hashes:
                 continue
             seen_hashes.add(tx['hash'])
-            if display_count >= min(len(h), hb - 15):
+            if display_count >= min(len(h), hb - 17):
                 break
             is_pending = not tx.get('epoch')
-            # Highlight pending transactions
             time_color = c['y'] if is_pending else c['w']
-            at(x + 2, y + 12 + display_count, tx['time'].strftime('%H:%M:%S'), time_color)
-            at(x + 11, y + 12 + display_count, " in" if tx['type'] == 'in' else "out", c['g'] if tx['type'] == 'in' else c['R'])
-            at(x + 16, y + 12 + display_count, f"{float(tx['amt']):>10.6f}", c['w'])
-            at(x + 28, y + 12 + display_count, str(tx.get('to', '---')), c['y'])
-            # Highlight pending status
+            at(x + 2, y + 14 + display_count, tx['time'].strftime('%H:%M:%S'), time_color)
+            at(x + 11, y + 14 + display_count, " in" if tx['type'] == 'in' else "out", c['g'] if tx['type'] == 'in' else c['R'])
+            at(x + 16, y + 14 + display_count, f"{float(tx['amt']):>10.6f}", c['w'])
+            at(x + 28, y + 14 + display_count, str(tx.get('to', '---')), c['y'])
+            if tx.get('msg'):
+                at(x + 77, y + 14 + display_count, "msg", c['c'])
             status_text = "pen" if is_pending else f"e{tx.get('epoch', 0)}"
             status_color = c['y'] + c['B'] if is_pending else c['c']
-            at(x + w - 6, y + 12 + display_count, status_text, status_color)
+            at(x + w - 6, y + 14 + display_count, status_text, status_color)
             display_count += 1
 
 def menu(x, y, w, h):
     box(x, y, w, h, "commands")
-    at(x + 2, y + 3, "[1] send 1 tx manual", c['w'])
-    at(x + 2, y + 4, "[2] refresh balance", c['w'])
-    at(x + 2, y + 5, "[3] multisend address.txt", c['w'])
-    at(x + 2, y + 6, "[4] export private keys", c['w'])
-    at(x + 2, y + 7, "[5] clear history", c['w'])
-    at(x + 2, y + 8, "[6] auto send random", c['w'])
-    at(x + 2, y + 11, "[0] exit", c['w'])
+    at(x + 2, y + 2, "[1] Send Transfer", c['w'])
+    at(x + 2, y + 3, "[2] Refresh", c['w'])
+    at(x + 2, y + 4, "[3] Multi Transfer", c['w'])
+    at(x + 2, y + 5, "[4] Encrypt Balance", c['w'])
+    at(x + 2, y + 6, "[5] Decrypt Balance", c['w'])
+    at(x + 2, y + 7, "[6] Private Transfer", c['w'])
+    at(x + 2, y + 8, "[7] Claim Transfers", c['w'])
+    at(x + 2, y + 9, "[8] Export Keys", c['w'])
+    at(x + 2, y + 10, "[9] Clear History", c['w'])
+    at(x + 2, y + 11, "[0] Exit", c['w'])
     at(x + 2, y + h - 2, "command: ", c['B'] + c['y'])
 
 async def scr():
     cr = sz()
     cls()
     fill()
-    t = f" octra pre-client v0.0.12 (dev) │ {datetime.now().strftime('%H:%M:%S')} "
+    t = f" octra client v0.1.0 (private) │ {datetime.now().strftime('%H:%M:%S')} "
     at((cr[0] - len(t)) // 2, 1, t, c['B'] + c['w'])
     
     sidebar_w = 28
-    menu(2, 3, sidebar_w, 17)
+    menu(2, 3, sidebar_w, 15)
     
-    # info box
-    info_y = 21
-    box(2, info_y, sidebar_w, 9)
+    info_y = 19
+    box(2, info_y, sidebar_w, 11)
     at(4, info_y + 2, "testnet environment.", c['y'])
     at(4, info_y + 3, "actively updated.", c['y'])
     at(4, info_y + 4, "monitor changes!", c['y'])
     at(4, info_y + 5, "", c['y'])
-    at(4, info_y + 6, "testnet tokens have", c['y'])
-    at(4, info_y + 7, "no commercial value.", c['y'])
+    at(4, info_y + 6, "private transactions", c['g'])
+    at(4, info_y + 7, "enabled", c['g'])
+    at(4, info_y + 8, "", c['y'])
+    at(4, info_y + 9, "tokens: no value", c['R'])
     
     explorer_x = sidebar_w + 4
     explorer_w = cr[0] - explorer_x - 2
@@ -335,13 +614,13 @@ async def scr():
     
     at(2, cr[1] - 1, " " * (cr[0] - 4), c['bg'])
     at(2, cr[1] - 1, "ready", c['bgg'] + c['w'])
-    return await ainp(13, 20) # disesuaikan dengan posisi command prompt
+    return await ainp(12, 16)
 
 async def tx():
     cr = sz()
     cls()
     fill()
-    w, hb = 85, 22
+    w, hb = 85, 26
     x = (cr[0] - w) // 2
     y = (cr[1] - hb) // 2
     box(x, y, w, hb, "send transaction")
@@ -367,30 +646,42 @@ async def tx():
         await ainp(x + 2, y + 16)
         return
     a = float(a)
+    at(x + 2, y + 10, f"amount: {a:.6f} oct", c['g'])
+    at(x + 2, y + 12, "message (optional, max 1024): (or enter to skip)", c['y'])
+    at(x + 2, y + 13, "─" * (w - 4), c['w'])
+    msg = await ainp(x + 2, y + 14)
+    if not msg:
+        msg = None
+    elif len(msg) > 1024:
+        msg = msg[:1024]
+        at(x + 2, y + 15, "message truncated to 1024 chars", c['y'])
+    
     global lu
     lu = 0
     n, b = await st()
     if n is None:
-        at(x + 2, y + 14, "failed to get nonce!", c['bgr'] + c['w'])
-        at(x + 2, y + 15, "press enter to go back...", c['y'])
-        await ainp(x + 2, y + 16)
+        at(x + 2, y + 17, "failed to get nonce!", c['bgr'] + c['w'])
+        at(x + 2, y + 18, "press enter to go back...", c['y'])
+        await ainp(x + 2, y + 19)
         return
     if not b or b < a:
-        at(x + 2, y + 14, f"insufficient balance ({b:.6f} < {a})", c['bgr'] + c['w'])
-        at(x + 2, y + 15, "press enter to go back...", c['y'])
-        await ainp(x + 2, y + 16)
+        at(x + 2, y + 17, f"insufficient balance ({b:.6f} < {a})", c['bgr'] + c['w'])
+        at(x + 2, y + 18, "press enter to go back...", c['y'])
+        await ainp(x + 2, y + 19)
         return
-    at(x + 2, y + 11, "─" * (w - 4), c['w'])
-    at(x + 2, y + 12, f"send {a:.6f} oct", c['B'] + c['g'])
-    at(x + 2, y + 13, f"to:  {to}", c['g'])
-    at(x + 2, y + 14, f"fee: {'0.001' if a < 1000 else '0.003'} oct (nonce: {n + 1})", c['y'])
-    at(x + 2, y + 15, "[y]es / [n]o: ", c['B'] + c['y'])
-    if (await ainp(x + 16, y + 15)).strip().lower() != 'y':
+    at(x + 2, y + 16, "─" * (w - 4), c['w'])
+    at(x + 2, y + 17, f"send {a:.6f} oct", c['B'] + c['g'])
+    at(x + 2, y + 18, f"to:  {to}", c['g'])
+    if msg:
+        at(x + 2, y + 19, f"msg: {msg[:50]}{'...' if len(msg) > 50 else ''}", c['c'])
+    at(x + 2, y + 20, f"fee: {'0.001' if a < 1000 else '0.003'} oct (nonce: {n + 1})", c['y'])
+    at(x + 2, y + 21, "[y]es / [n]o: ", c['B'] + c['y'])
+    if (await ainp(x + 16, y + 21)).strip().lower() != 'y':
         return
     
-    spin_task = asyncio.create_task(spin_animation(x + 2, y + 16, "sending transaction"))
+    spin_task = asyncio.create_task(spin_animation(x + 2, y + 22, "sending transaction"))
     
-    t, _ = mk(to, a, n + 1)
+    t, _ = mk(to, a, n + 1, msg)
     ok, hs, dt, r = await snd(t)
     
     spin_task.cancel()
@@ -400,26 +691,27 @@ async def tx():
         pass
     
     if ok:
-        for i in range(16, 21):
+        for i in range(17, 25):
             at(x + 2, y + i, " " * (w - 4), c['bg'])
-        at(x + 2, y + 16, f"✓ transaction accepted!", c['bgg'] + c['w'])
-        at(x + 2, y + 17, f"hash: {hs[:64]}...", c['g'])
-        at(x + 2, y + 18, f"      {hs[64:]}", c['g'])
-        at(x + 2, y + 19, f"time: {dt:.2f}s", c['w'])
+        at(x + 2, y + 20, f"✓ transaction accepted!", c['bgg'] + c['w'])
+        at(x + 2, y + 21, f"hash: {hs[:64]}...", c['g'])
+        at(x + 2, y + 22, f"      {hs[64:]}", c['g'])
+        at(x + 2, y + 23, f"time: {dt:.2f}s", c['w'])
         if r and 'pool_info' in r:
-            at(x + 2, y + 20, f"pool: {r['pool_info'].get('total_pool_size', 0)} txs pending", c['y'])
+            at(x + 2, y + 24, f"pool: {r['pool_info'].get('total_pool_size', 0)} txs pending", c['y'])
         h.append({
             'time': datetime.now(),
             'hash': hs,
             'amt': a,
             'to': to,
             'type': 'out',
-            'ok': True
+            'ok': True,
+            'msg': msg
         })
         lu = 0
     else:
-        at(x + 2, y + 16, f"✗ transaction failed!", c['bgr'] + c['w'])
-        at(x + 2, y + 17, f"error: {str(hs)[:w - 10]}", c['R'])
+        at(x + 2, y + 20, f"✗ transaction failed!", c['bgr'] + c['w'])
+        at(x + 2, y + 21, f"error: {str(hs)[:w - 10]}", c['R'])
     await awaitkey()
 
 async def multi():
@@ -430,76 +722,52 @@ async def multi():
     x = (cr[0] - w) // 2
     y = 2
     box(x, y, w, hb, "multi send")
-    
-    # Check for address.txt file
-    if not os.path.exists('address.txt'):
-        at(x + 2, y + 2, "Error: address.txt not found", c['bgr'] + c['w'])
-        at(x + 2, y + 3, "Create address.txt with format:", c['y'])
-        at(x + 2, y + 4, "oct123...abc 0.1", c['w'])
-        at(x + 2, y + 5, "oct456...def 0.2", c['w'])
-        at(x + 2, y + 6, "(one address per line)", c['y'])
-        await awaitkey()
-        return
-    
-    # Read addresses from file
-    try:
-        with open('address.txt', 'r') as f:
-            lines = [line.strip() for line in f if line.strip()]
-        
-        rcp = []
-        for line in lines:
-            parts = line.split()
-            if len(parts) >= 2:  # Changed to >= to handle any extra spaces
-                address = parts[0]
-                amount = parts[1]
-                if b58.match(address) and re.match(r"^\d+(\.\d+)?$", amount) and float(amount) > 0:
-                    rcp.append((address, float(amount)))
-        
-        if not rcp:
-            at(x + 2, y + 2, "No valid addresses in address.txt", c['bgr'] + c['w'])
-            at(x + 2, y + 3, "Format: address amount", c['y'])
-            at(x + 2, y + 4, "Example:", c['y'])
-            at(x + 2, y + 5, "octg3VxfmbH6I2XwZDCGHy03z4VuCdACW1keZfP2lrF3gh 0.1", c['w'])
-            await awaitkey()
+    at(x + 2, y + 2, "enter recipients (address amount), empty line to finish:", c['y'])
+    at(x + 2, y + 3, "type [esc] to cancel", c['c'])
+    at(x + 2, y + 4, "─" * (w - 4), c['w'])
+    rcp = []
+    tot = 0
+    ly = y + 5
+    while ly < y + hb - 8:
+        at(x + 2, ly, f"[{len(rcp) + 1}] ", c['c'])
+        l = await ainp(x + 7, ly)
+        if l.lower() == 'esc':
             return
-    except Exception as e:
-        at(x + 2, y + 2, f"Error reading address.txt: {str(e)}", c['bgr'] + c['w'])
-        await awaitkey()
+        if not l:
+            break
+        p = l.split()
+        if len(p) == 2 and b58.match(p[0]) and re.match(r"^\d+(\.\d+)?$", p[1]) and float(p[1]) > 0:
+            a = float(p[1])
+            rcp.append((p[0], a))
+            tot += a
+            at(x + 50, ly, f"+{a:.6f}", c['g'])
+            ly += 1
+        else:
+            at(x + 50, ly, "invalid!", c['R'])
+    if not rcp:
         return
-    
-    # Display loaded addresses
-    at(x + 2, y + 2, f"Loaded {len(rcp)} addresses from address.txt", c['g'])
-    at(x + 2, y + 3, "─" * (w - 4), c['w'])
-    
-    # Calculate total amount
-    tot = sum(a for _, a in rcp)
-    at(x + 2, y + 4, f"Total amount: {tot:.6f} OCT", c['B'] + c['y'])
-    
-    # Check balance and nonce
+    at(x + 2, y + hb - 7, "─" * (w - 4), c['w'])
+    at(x + 2, y + hb - 6, f"total: {tot:.6f} oct to {len(rcp)} addresses", c['B'] + c['y'])
     global lu
     lu = 0
     n, b = await st()
     if n is None:
-        at(x + 2, y + 6, "Failed to get nonce!", c['bgr'] + c['w'])
-        await awaitkey()
+        at(x + 2, y + hb - 5, "failed to get nonce!", c['bgr'] + c['w'])
+        at(x + 2, y + hb - 4, "press enter to go back...", c['y'])
+        await ainp(x + 2, y + hb - 3)
         return
-    
     if not b or b < tot:
-        at(x + 2, y + 6, f"Insufficient balance! ({b:.6f} < {tot})", c['bgr'] + c['w'])
-        await awaitkey()
+        at(x + 2, y + hb - 5, f"insufficient balance! ({b:.6f} < {tot})", c['bgr'] + c['w'])
+        at(x + 2, y + hb - 4, "press enter to go back...", c['y'])
+        await ainp(x + 2, y + hb - 3)
+        return
+    at(x + 2, y + hb - 5, f"send all? [y/n] (starting nonce: {n + 1}): ", c['y'])
+    if (await ainp(x + 48, y + hb - 5)).strip().lower() != 'y':
         return
     
-    at(x + 2, y + 6, f"Starting nonce: {n + 1}", c['y'])
-    at(x + 2, y + 7, "─" * (w - 4), c['w'])
-    at(x + 2, y + 8, "Confirm batch send? [y/n]: ", c['B'] + c['y'])
-    confirm = await ainp(x + 30, y + 8)
-    if confirm.strip().lower() != 'y':
-        return
+    spin_task = asyncio.create_task(spin_animation(x + 2, y + hb - 3, "sending transactions"))
     
-    # Start sending transactions
-    spin_task = asyncio.create_task(spin_animation(x + 2, y + 10, "Sending transactions"))
-    
-    batch_size = 5  # Number of parallel transactions
+    batch_size = 5
     batches = [rcp[i:i+batch_size] for i in range(0, len(rcp), batch_size)]
     s_total, f_total = 0, 0
     
@@ -507,7 +775,7 @@ async def multi():
         tasks = []
         for i, (to, a) in enumerate(batch):
             idx = batch_idx * batch_size + i
-            at(x + 2, y + 12, f"[{idx + 1}/{len(rcp)}] Preparing...", c['c'])
+            at(x + 2, y + hb - 2, f"[{idx + 1}/{len(rcp)}] preparing batch...", c['c'])
             t, _ = mk(to, a, n + 1 + idx)
             tasks.append(snd(t))
         
@@ -517,14 +785,12 @@ async def multi():
             idx = batch_idx * batch_size + i
             if isinstance(result, Exception):
                 f_total += 1
-                status = "✗ fail "
-                color = c['R']
+                at(x + 55, y + hb - 2, "✗ fail ", c['R'])
             else:
                 ok, hs, _, _ = result
                 if ok:
                     s_total += 1
-                    status = "✓ ok   "
-                    color = c['g']
+                    at(x + 55, y + hb - 2, "✓ ok   ", c['g'])
                     h.append({
                         'time': datetime.now(),
                         'hash': hs,
@@ -535,10 +801,8 @@ async def multi():
                     })
                 else:
                     f_total += 1
-                    status = "✗ fail "
-                    color = c['R']
-            
-            at(x + 2, y + 13 + i, f"[{idx + 1}/{len(rcp)}] {a:.6f} to {to[:20]}... {status}", color)
+                    at(x + 55, y + hb - 2, "✗ fail ", c['R'])
+            at(x + 2, y + hb - 2, f"[{idx + 1}/{len(rcp)}] {a:.6f} to {to[:20]}...", c['c'])
             await asyncio.sleep(0.05)
     
     spin_task.cancel()
@@ -549,150 +813,340 @@ async def multi():
     
     lu = 0
     at(x + 2, y + hb - 2, " " * 65, c['bg'])
-    result_msg = f"Completed: {s_total} success, {f_total} failed"
-    if f_total == 0:
-        at(x + 2, y + hb - 2, result_msg, c['bgg'] + c['w'])
-    else:
-        at(x + 2, y + hb - 2, result_msg, c['bgr'] + c['w'])
-    
-    # Save results to log file in log/ directory
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_filename = f"multisend_{timestamp}.log"
-    
-    # Create log directory if it doesn't exist
-    os.makedirs('log', exist_ok=True)
-    
-    # Save to log/ directory
-    log_path = os.path.join('log', log_filename)
-    with open(log_path, 'w') as f:
-        f.write(f"Multi-send results - {timestamp}\n")
-        f.write(f"Total addresses: {len(rcp)}\n")
-        f.write(f"Success: {s_total}\n")
-        f.write(f"Failed: {f_total}\n")
-        f.write(f"Total amount sent: {tot:.6f} OCT\n")
-    
-    at(x + 2, y + hb - 1, f"Results saved to {log_path}", c['y'])
+    at(x + 2, y + hb - 2, f"completed: {s_total} success, {f_total} failed", c['bgg'] + c['w'] if f_total == 0 else c['bgr'] + c['w'])
     await awaitkey()
 
-async def auto_send_random():
+async def encrypt_balance_ui():
     cr = sz()
     cls()
     fill()
-    w, hb = 70, cr[1] - 4
+    w, hb = 70, 20
+    x = (cr[0] - w) // 2
+    y = (cr[1] - hb) // 2
+    
+    box(x, y, w, hb, "encrypt balance")
+    
+    _, pub_bal = await st()
+    enc_data = await get_encrypted_balance()
+    
+    if not enc_data:
+        at(x + 2, y + 10, "cannot get encrypted balance info", c['R'])
+        await awaitkey()
+        return
+    
+    at(x + 2, y + 2, "public balance:", c['c'])
+    at(x + 20, y + 2, f"{pub_bal:.6f} oct", c['w'])
+    
+    at(x + 2, y + 3, "encrypted:", c['c'])
+    at(x + 20, y + 3, f"{enc_data['encrypted']:.6f} oct", c['y'])
+    
+    at(x + 2, y + 4, "total:", c['c'])
+    at(x + 20, y + 4, f"{enc_data['total']:.6f} oct", c['g'])
+    
+    at(x + 2, y + 6, "─" * (w - 4), c['w'])
+    
+    max_encrypt = enc_data['public_raw'] / μ - 1.0
+    if max_encrypt <= 0:
+        at(x + 2, y + 8, "insufficient public balance (need > 1 oct for fees)", c['R'])
+        await awaitkey()
+        return
+    
+    at(x + 2, y + 7, f"max encryptable: {max_encrypt:.6f} oct", c['y'])
+    
+    at(x + 2, y + 9, "amount to encrypt:", c['y'])
+    amount = await ainp(x + 21, y + 9)
+    
+    if not amount or not re.match(r"^\d+(\.\d+)?$", amount) or float(amount) <= 0:
+        return
+    
+    amount = float(amount)
+    if amount > max_encrypt:
+        at(x + 2, y + 11, f"amount too large (max: {max_encrypt:.6f})", c['R'])
+        await awaitkey()
+        return
+    
+    at(x + 2, y + 11, f"encrypt {amount:.6f} oct? [y/n]:", c['B'] + c['y'])
+    if (await ainp(x + 30, y + 11)).strip().lower() != 'y':
+        return
+    
+    spin_task = asyncio.create_task(spin_animation(x + 2, y + 14, "encrypting balance"))
+    
+    ok, result = await encrypt_balance(amount)
+    
+    spin_task.cancel()
+    try:
+        await spin_task
+    except asyncio.CancelledError:
+        pass
+    
+    if ok:
+        at(x + 2, y + 14, "✓ encryption submitted!", c['bgg'] + c['w'])
+        at(x + 2, y + 15, f"tx hash: {result.get('tx_hash', 'unknown')[:50]}...", c['g'])
+        at(x + 2, y + 16, f"will process in next epoch", c['g'])
+    else:
+        at(x + 2, y + 14, f"✗ error: {result.get('error', 'unknown')}", c['bgr'] + c['w'])
+    
+    await awaitkey()
+
+async def decrypt_balance_ui():
+    cr = sz()
+    cls()
+    fill()
+    w, hb = 70, 20
+    x = (cr[0] - w) // 2
+    y = (cr[1] - hb) // 2
+    
+    box(x, y, w, hb, "decrypt balance")
+    
+    _, pub_bal = await st()
+    enc_data = await get_encrypted_balance()
+    
+    if not enc_data:
+        at(x + 2, y + 10, "cannot get encrypted balance info", c['R'])
+        await awaitkey()
+        return
+    
+    at(x + 2, y + 2, "public balance:", c['c'])
+    at(x + 20, y + 2, f"{pub_bal:.6f} oct", c['w'])
+    
+    at(x + 2, y + 3, "encrypted:", c['c'])
+    at(x + 20, y + 3, f"{enc_data['encrypted']:.6f} oct", c['y'])
+    
+    at(x + 2, y + 4, "total:", c['c'])
+    at(x + 20, y + 4, f"{enc_data['total']:.6f} oct", c['g'])
+    
+    at(x + 2, y + 6, "─" * (w - 4), c['w'])
+    
+    if enc_data['encrypted_raw'] == 0:
+        at(x + 2, y + 8, "no encrypted balance to decrypt", c['R'])
+        await awaitkey()
+        return
+    
+    max_decrypt = enc_data['encrypted_raw'] / μ
+    at(x + 2, y + 7, f"max decryptable: {max_decrypt:.6f} oct", c['y'])
+    
+    at(x + 2, y + 9, "amount to decrypt:", c['y'])
+    amount = await ainp(x + 21, y + 9)
+    
+    if not amount or not re.match(r"^\d+(\.\d+)?$", amount) or float(amount) <= 0:
+        return
+    
+    amount = float(amount)
+    if amount > max_decrypt:
+        at(x + 2, y + 11, f"amount too large (max: {max_decrypt:.6f})", c['R'])
+        await awaitkey()
+        return
+    
+    at(x + 2, y + 11, f"decrypt {amount:.6f} oct? [y/n]:", c['B'] + c['y'])
+    if (await ainp(x + 30, y + 11)).strip().lower() != 'y':
+        return
+    
+    spin_task = asyncio.create_task(spin_animation(x + 2, y + 14, "decrypting balance"))
+    
+    ok, result = await decrypt_balance(amount)
+    
+    spin_task.cancel()
+    try:
+        await spin_task
+    except asyncio.CancelledError:
+        pass
+    
+    if ok:
+        at(x + 2, y + 14, "✓ decryption submitted!", c['bgg'] + c['w'])
+        at(x + 2, y + 15, f"tx hash: {result.get('tx_hash', 'unknown')[:50]}...", c['g'])
+        at(x + 2, y + 16, f"will process in next epoch", c['g'])
+    else:
+        at(x + 2, y + 14, f"✗ error: {result.get('error', 'unknown')}", c['bgr'] + c['w'])
+    
+    await awaitkey()
+
+async def private_transfer_ui():
+    cr = sz()
+    cls()
+    fill()
+    w, hb = 80, 25
+    x = (cr[0] - w) // 2
+    y = (cr[1] - hb) // 2
+    
+    box(x, y, w, hb, "private transfer")
+    
+    enc_data = await get_encrypted_balance()
+    if not enc_data or enc_data['encrypted_raw'] == 0:
+        at(x + 2, y + 10, "no encrypted balance available", c['R'])
+        at(x + 2, y + 11, "encrypt some balance first", c['y'])
+        await awaitkey()
+        return
+    
+    at(x + 2, y + 2, f"encrypted balance: {enc_data['encrypted']:.6f} oct", c['g'])
+    at(x + 2, y + 3, "─" * (w - 4), c['w'])
+    
+    at(x + 2, y + 5, "recipient address:", c['y'])
+    to_addr = await ainp(x + 2, y + 6)
+    
+    if not to_addr or not b58.match(to_addr):
+        at(x + 2, y + 12, "invalid address", c['R'])
+        await awaitkey()
+        return
+    
+    if to_addr == addr:
+        at(x + 2, y + 12, "cannot send to yourself", c['R'])
+        await awaitkey()
+        return
+    
+    spin_task = asyncio.create_task(spin_animation(x + 2, y + 8, "checking recipient"))
+    
+    addr_info = await get_address_info(to_addr)
+    
+    spin_task.cancel()
+    try:
+        await spin_task
+    except asyncio.CancelledError:
+        pass
+    
+    if not addr_info:
+        at(x + 2, y + 12, "recipient address not found on blockchain", c['R'])
+        await awaitkey()
+        return
+    
+    if not addr_info.get('has_public_key'):
+        at(x + 2, y + 12, "recipient has no public key", c['R'])
+        at(x + 2, y + 13, "they need to make a transaction first", c['y'])
+        await awaitkey()
+        return
+    
+    at(x + 2, y + 8, f"recipient balance: {addr_info.get('balance', 'unknown')}", c['c'])
+    
+    at(x + 2, y + 10, "amount:", c['y'])
+    amount = await ainp(x + 10, y + 10)
+    
+    if not amount or not re.match(r"^\d+(\.\d+)?$", amount) or float(amount) <= 0:
+        return
+    
+    amount = float(amount)
+    if amount > enc_data['encrypted'] :
+        at(x + 2, y + 14, f"insufficient encrypted balance", c['R'])
+        await awaitkey()
+        return
+    
+    at(x + 2, y + 12, "─" * (w - 4), c['w'])
+    at(x + 2, y + 13, f"send {amount:.6f} oct privately to", c['B'])
+    at(x + 2, y + 14, to_addr, c['y'])
+    at(x + 2, y + 16, "[y]es / [n]o:", c['B'] + c['y'])
+    
+    if (await ainp(x + 15, y + 16)).strip().lower() != 'y':
+        return
+    
+    spin_task = asyncio.create_task(spin_animation(x + 2, y + 18, "creating private transfer"))
+    
+    ok, result = await create_private_transfer(to_addr, amount)
+    
+    spin_task.cancel()
+    try:
+        await spin_task
+    except asyncio.CancelledError:
+        pass
+    
+    if ok:
+        at(x + 2, y + 18, "✓ private transfer submitted!", c['bgg'] + c['w'])
+        at(x + 2, y + 19, f"tx hash: {result.get('tx_hash', 'unknown')[:50]}...", c['g'])
+        at(x + 2, y + 20, f"recipient can claim in next epoch", c['g'])
+        at(x + 2, y + 21, f"ephemeral key: {result.get('ephemeral_key', 'unknown')[:40]}...", c['c'])
+    else:
+        at(x + 2, y + 18, f"✗ error: {result.get('error', 'unknown')[:w-10]}", c['bgr'] + c['w'])
+    
+    await awaitkey()
+
+async def claim_transfers_ui():
+    cr = sz()
+    cls()
+    fill()
+    w, hb = 85, cr[1] - 4
     x = (cr[0] - w) // 2
     y = 2
-    box(x, y, w, hb, "auto send to random addresses")
-
-    # Get number of transactions
-    at(x + 2, y + 2, "how many transactions to send?", c['y'])
-    num_tx_str = await ainp(x + 2, y + 3)
-    if not num_tx_str.isdigit() or int(num_tx_str) <= 0:
-        at(x + 2, y + 5, "invalid number!", c['bgr'] + c['w'])
-        await awaitkey()
-        return
-    num_tx = int(num_tx_str)
-
-    # Get amount per transaction
-    at(x + 2, y + 5, "amount of OCT per transaction?", c['y'])
-    amount_str = await ainp(x + 2, y + 6)
-    if not re.match(r"^\d+(\.\d+)?$", amount_str) or float(amount_str) <= 0:
-        at(x + 2, y + 8, "invalid amount!", c['bgr'] + c['w'])
-        await awaitkey()
-        return
-    amount_per_tx = float(amount_str)
-
-    # Calculate total and check balance
-    total_amount = num_tx * amount_per_tx
-    at(x + 2, y + 8, "─" * (w - 4), c['w'])
-    at(x + 2, y + 9, f"total to send: {total_amount:.6f} OCT ({num_tx} txs)", c['B'] + c['y'])
-
-    global lu
-    lu = 0
-    n, b = await st()
-    if n is None or b is None:
-        at(x + 2, y + 11, "failed to get balance/nonce!", c['bgr'] + c['w'])
-        await awaitkey()
-        return
-
-    if b < total_amount:
-        at(x + 2, y + 11, f"insufficient balance! ({b:.6f} < {total_amount:.6f})", c['bgr'] + c['w'])
-        await awaitkey()
-        return
-
-    at(x + 2, y + 11, f"current balance: {b:.6f} OCT, starting nonce: {n + 1}", c['g'])
-    at(x + 2, y + 12, "confirm batch send? [y/n]: ", c['B'] + c['y'])
-    confirm = await ainp(x + 30, y + 12)
-    if confirm.strip().lower() != 'y':
-        return
-
-    # Clear confirmation lines
-    for i in range(8, 14):
-        at(x + 2, y + i, " " * (w - 4), "")
-
-    # Start sending
-    spin_task = asyncio.create_task(spin_animation(x + 2, y + 10, "Preparing & Sending transactions..."))
-
-    batch_size = 10
-    batches = [range(i, min(i + batch_size, num_tx)) for i in range(0, num_tx, batch_size)]
-    s_total, f_total = 0, 0
-    display_offset = 12
-    max_lines = hb - display_offset - 3
-
-    for batch_idx, batch_range in enumerate(batches):
-        tasks = []
-        tx_data = []
-        for i in batch_range:
-            to_address = generate_octra_address()
-            current_nonce = n + 1 + i
-            t, _ = mk(to_address, amount_per_tx, current_nonce)
-            tasks.append(snd(t))
-            tx_data.append({'addr': to_address, 'nonce': current_nonce})
-
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        for i, (result, data) in enumerate(zip(results, tx_data)):
-            total_idx = batch_idx * batch_size + i
-            display_line = y + display_offset + (total_idx % max_lines)
-
-            if total_idx > 0 and total_idx % max_lines == 0:
-                for j in range(max_lines):
-                    at(x + 2, y + display_offset + j, " " * (w - 4), c['bg'])
-
-            if isinstance(result, Exception):
-                f_total += 1
-                status = "✗ fail"
-                color = c['R']
-            else:
-                ok, hs, _, _ = result
-                if ok:
-                    s_total += 1
-                    status = "✓ ok"
-                    color = c['g']
-                    h.append({
-                        'time': datetime.now(), 'hash': hs, 'amt': amount_per_tx,
-                        'to': data['addr'], 'type': 'out', 'ok': True
-                    })
-                else:
-                    f_total += 1
-                    status = "✗ fail"
-                    color = c['R']
-            
-            msg = f"[{total_idx + 1}/{num_tx}] {amount_per_tx:.6f} to {data['addr'][:20]}... {status}"
-            at(x + 2, display_line, " " * (w - 4), c['bg'])
-            at(x + 2, display_line, msg, color)
-            await asyncio.sleep(0.01)
-
+    
+    box(x, y, w, hb, "claim private transfers")
+    
+    spin_task = asyncio.create_task(spin_animation(x + 2, y + 2, "loading pending transfers"))
+    
+    transfers = await get_pending_transfers()
+    
     spin_task.cancel()
-    try: await spin_task
-    except asyncio.CancelledError: pass
-
-    lu = 0
-
-    summary_line = y + hb - 2
-    at(x + 2, summary_line, " " * (w - 4), c['bg'])
-    result_msg = f"Completed: {s_total} success, {f_total} failed"
-    result_color = c['bgg'] + c['w'] if f_total == 0 else c['bgr'] + c['w']
-    at(x + 2, summary_line, result_msg, result_color)
+    try:
+        await spin_task
+    except asyncio.CancelledError:
+        pass
+    
+    if not transfers:
+        at(x + 2, y + 10, "no pending transfers", c['y'])
+        await awaitkey()
+        return
+    
+    at(x + 2, y + 2, f"found {len(transfers)} claimable transfers:", c['B'] + c['g'])
+    at(x + 2, y + 4, "#   FROM                AMOUNT         EPOCH   ID", c['c'])
+    at(x + 2, y + 5, "─" * (w - 4), c['w'])
+    
+    display_y = y + 6
+    max_display = min(len(transfers), hb - 12)
+    
+    for i, t in enumerate(transfers[:max_display]):
+        amount_str = "[encrypted]"
+        amount_color = c['y']
+        
+        if t.get('encrypted_data') and t.get('ephemeral_key'):
+            try:
+                shared = derive_shared_secret_for_claim(priv, t['ephemeral_key'])
+                amt = decrypt_private_amount(t['encrypted_data'], shared)
+                if amt:
+                    amount_str = f"{amt/μ:.6f} OCT"
+                    amount_color = c['g']
+            except:
+                pass
+        
+        at(x + 2, display_y + i, f"[{i+1}]", c['c'])
+        at(x + 8, display_y + i, t['sender'][:20] + "...", c['w'])
+        at(x + 32, display_y + i, amount_str, amount_color)
+        at(x + 48, display_y + i, f"ep{t.get('epoch_id', '?')}", c['c'])
+        at(x + 58, display_y + i, f"#{t.get('id', '?')}", c['y'])
+    
+    if len(transfers) > max_display:
+        at(x + 2, display_y + max_display + 1, f"... and {len(transfers) - max_display} more", c['y'])
+    
+    at(x + 2, y + hb - 6, "─" * (w - 4), c['w'])
+    at(x + 2, y + hb - 5, "enter number to claim (0 to cancel):", c['y'])
+    choice = await ainp(x + 40, y + hb - 5)
+    
+    if not choice or choice == '0':
+        return
+    
+    try:
+        idx = int(choice) - 1
+        if 0 <= idx < len(transfers):
+            transfer = transfers[idx]
+            transfer_id = transfer['id']
+            
+            spin_task = asyncio.create_task(spin_animation(x + 2, y + hb - 3, f"claiming transfer #{transfer_id}"))
+            
+            ok, result = await claim_private_transfer(transfer_id)
+            
+            spin_task.cancel()
+            try:
+                await spin_task
+            except asyncio.CancelledError:
+                pass
+            
+            if ok:
+                at(x + 2, y + hb - 3, f"✓ claimed {result.get('amount', 'unknown')}!", c['bgg'] + c['w'])
+                at(x + 2, y + hb - 2, "your encrypted balance has been updated", c['g'])
+            else:
+                error_msg = result.get('error', 'unknown error')
+                at(x + 2, y + hb - 3, f"✗ error: {error_msg[:w-10]}", c['bgr'] + c['w'])
+        else:
+            at(x + 2, y + hb - 3, "invalid selection", c['R'])
+    except ValueError:
+        at(x + 2, y + hb - 3, "invalid number", c['R'])
+    except Exception:
+        at(x + 2, y + hb - 3, f"error occurred", c['R'])
+    
     await awaitkey()
 
 async def exp():
@@ -743,8 +1197,10 @@ async def exp():
             'addr': addr,
             'rpc': rpc
         }
+        os.umask(0o077)
         with open(fn, 'w') as f:
             json.dump(wallet_data, f, indent=2)
+        os.chmod(fn, 0o600)
         at(x + 2, y + 7, " " * (w - 4), c['bg'])
         at(x + 2, y + 8, " " * (w - 4), c['bg'])
         at(x + 2, y + 9, " " * (w - 4), c['bg'])
@@ -767,8 +1223,17 @@ async def exp():
         at(x + 2, y + 11, " " * (w - 4), c['bg'])
         await awaitkey()
 
+def signal_handler(sig, frame):
+    stop_flag.set()
+    if session:
+        asyncio.create_task(session.close())
+    sys.exit(0)
+
 async def main():
     global session
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
     
     if not ld():
         sys.exit("[!] wallet.json error")
@@ -781,6 +1246,7 @@ async def main():
         
         while not stop_flag.is_set():
             cmd = await scr()
+            
             if cmd == '1':
                 await tx()
             elif cmd == '2':
@@ -791,15 +1257,21 @@ async def main():
             elif cmd == '3':
                 await multi()
             elif cmd == '4':
-                await exp()
+                await encrypt_balance_ui()
             elif cmd == '5':
+                await decrypt_balance_ui()
+            elif cmd == '6':
+                await private_transfer_ui()
+            elif cmd == '7':
+                await claim_transfers_ui()
+            elif cmd == '8':
+                await exp()
+            elif cmd == '9':
                 h.clear()
                 lh = 0
-            elif cmd == '6':
-                await auto_send_random()
             elif cmd in ['0', 'q', '']:
                 break
-    except:
+    except Exception:
         pass
     finally:
         if session:
@@ -812,7 +1284,9 @@ if __name__ == "__main__":
     
     try:
         asyncio.run(main())
-    except:
+    except KeyboardInterrupt:
+        pass
+    except Exception:
         pass
     finally:
         cls()
