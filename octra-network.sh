@@ -139,7 +139,7 @@ install_python_packages() {
     log_success "PIP has been upgraded to the latest version."
 
     log_step 9 "Installing Packages Requirements"
-    sudo -E pip install --no-cache-dir -r requirements.txt
+    sudo -E pip install -r requirements.txt
     log_success "All required Python packages have been installed."
 }
 
