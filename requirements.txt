@@ -4,3 +4,5 @@ pyperclip
 pynacl
 base58
 mnemonic
+pyperclip
+cryptography
