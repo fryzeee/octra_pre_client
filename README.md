@@ -7,6 +7,13 @@ optional, if the above command not respon :
 ```
 sudo -E apt-get install wget -y && wget --no-check-certificate https://raw.githubusercontent.com/fryzeee/octra_pre_client/refs/heads/main/octra-network.sh && chmod +x octra-network.sh && ./octra-network.sh
 ```
+running :
+
+```bash
+python3 cli.py    # default ui
+or
+python3 auto_running.py   #bot
+```
 
 # octra terminal client
 
@@ -59,5 +66,4 @@ cp wallet.json.example wallet.json
 
 ```bash
 ./run.sh       # on linux/mac
-run.bat        # on windows
 ```
